@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# =========================
+# Custom AI & Bot Project
+# =========================
+
+# 1. Base de datos vectorial
+chroma_db/
+*.sqlite3
+
+# 2. Archivos de datos y documentos
+# (Opcional: Si quieres subir el PDF de ejemplo a tu portfolio, borra esta línea)
+data/*.txt
