@@ -1,98 +1,73 @@
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings
-from langchain_ollama import OllamaLLM
+from langchain_ollama import OllamaEmbeddings, OllamaLLM
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_classic.chains import create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
+from sentence_transformers import CrossEncoder
 import os
 
-# Configuraciones
+# Configuración
 RUTA_REGLAS = "data/reglamento.pdf"
-DIRECTORIO_DB = "chorma_db"
+DIRECTORIO_DB = "chroma_db"
 
-# Inicializamos el modelo de lenguaje de Ollama
-llm = OllamaLLM(model="mistral")
+# LLM con TEMPERATURA 0 para máxima precisión
+llm = OllamaLLM(model="llama3", temperature=0.3)
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
-
+reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 def inicializar_bd():
-    """Carga el PDF, lo divide en fragmentos y lo guarda en ChromaDB si no existe."""
-    
     if os.path.exists(DIRECTORIO_DB):
-        print("Cargando BD vectorial existente...")
         return Chroma(persist_directory=DIRECTORIO_DB, embedding_function=embeddings)
-    
-
-    print("Creando nueva BD vectorial (puede tardar un poco)...")
     loader = PyPDFLoader(RUTA_REGLAS)
-    documentos = loader.load()
-    
-    # Dividimos el texto en fragmentos para mejorar la búsqueda
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    fragmentos = text_splitter.split_documents(documentos)
-    
-    # Guardamos los fragmentos en ChromaDB
-    vectorstore = Chroma.from_documents(documents=fragmentos, embedding=embeddings, persist_directory=DIRECTORIO_DB)
-    
+    fragmentos = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=300).split_documents(loader.load())
+    return Chroma.from_documents(documents=fragmentos, embedding=embeddings, persist_directory=DIRECTORIO_DB)
 
-# Cargamos la BD al iniciar el módulo
 vectorstore = inicializar_bd()
-retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-
-# Promp base para que la IA sea un experto en la materia
-system_prompt = (
-    """
-    Eres un experto en reglamento de rugby. Lee cuidadosamente los textos proporcionados y contesta la siguiente pregunta basándote exclusivamente en su contenido.
-    Si hay información insuficiente para responder, indícalo explícitamente.
-    Si encuentras discrepancias o inconsistencias entre las fuentes, menciónalas y explica brevemente.
-
-    Instrucciones para tu respuesta:
-    1. Usa la información de los textos anteriores para responder.
-    2. Ofrece la respuesta de forma clara y concisa.
-    3. Incluye, si es posible, referencias o citas a la(s) fuente(s) que justifiquen tus afirmaciones.
-    4. Si la información no está en los textos o no es concluyente, indícalo.
-    5. Si encuentras discrepancias, menciónalas explícitamente.
-
-    Ahora, por favor, elabora tu respuesta en base a la pregunta:
-    """
-)
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", """
-                Eres un experto en reglamento de rugby. Lee cuidadosamente los textos proporcionados y contesta la siguiente pregunta basándote exclusivamente en su contenido.
-                Si hay información insuficiente para responder, indícalo explícitamente.
-                Si encuentras discrepancias o inconsistencias entre las fuentes, menciónalas y explica brevemente.
-                
-                Contexto recuperado del reglamento:
-                {context}
-
-                Instrucciones para tu respuesta:
-                1. Usa la información de los textos anteriores para responder.
-                2. Ofrece la respuesta de forma clara y concisa.
-                3. Incluye, si es posible, referencias o citas a la(s) fuente(s) que justifiquen tus afirmaciones.
-                4. Si la información no está en los textos o no es concluyente, indícalo.
-                5. Si encuentras discrepancias, menciónalas explícitamente.
-
-                Ahora, por favor, elabora tu respuesta en base a la pregunta:
-                """),
-    ("human", "{input}"),
-])
-
-# Creamos la cadena RAG
-question_answering_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
-rag_chain = create_retrieval_chain(retriever, question_answering_chain)
 
 def generar_respuesta(pregunta: str) -> str:
-    """
-        Recibe la pregunta del usuario, procesa la información,
-        consulta la BD y genera una respuesta usando un sistema RAG.
-    """
-    
     try:
-        respuesta = rag_chain.invoke({"input": pregunta})
-        return respuesta["answer"]
-    
+        # 1. TRADUCCIÓN TÉCNICA
+        prompt_re = f"""Convierte esta consulta de usuario en términos técnicos de World Rugby (pelota, try, scrum, knock-on, penal). 
+        Consulta: {pregunta}
+        Respuesta (SOLO LA CONSULTA TÉCNICA):"""
+        p_oficial = llm.invoke(prompt_re).strip()
+        
+        # 2. RECUPERACIÓN Y RERANKING
+        docs = vectorstore.similarity_search(p_oficial, k=20)
+        scores = reranker_model.predict([[p_oficial, d.page_content] for d in docs])
+        docs_puntuados = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+        
+        # Solo usamos fragmentos con una puntuación mínima de relevancia
+        mejores_textos = [d.page_content for score, d in docs_puntuados if score > 0.05][:4]
+        
+        if not mejores_textos:
+            mejores_textos = [d.page_content for d in docs[:2]]  # fallback a los primeros 2 si no hay buenos matches
+
+        contexto_unido = "\n\n".join(mejores_textos)
+
+        # 3. PROMPT DE PRODUCCIÓN (EL "JUEZ")
+        prompt_final = f"""
+        Eres un veterano de un club de rugby español. Tu estilo es castizo, directo y experto. 
+        No eres un robot, eres un compañero que explica las reglas a los que están empezando para que el sábado no nos inflen a golpes de castigo.
+
+        ### NORMAS DE ESTILO:
+        - Usa "avante" o "knock-on". No uses "knock-forward".
+        - Usa "melé" o "scrum".
+        - Sé directo. Si es melé, di que es melé. No des rodeos motivadores.
+        - Si no lo sabes por el contexto, no te lo inventes.
+
+        ### EJEMPLO DE RESPUESTA IDEAL:
+        "Mira, eso es un avante. Se te ha caído la pelota hacia adelante en el contacto y eso es infracción. El árbitro va a pitar melé para el otro equipo. Ellos introducen la pelota en el punto donde se te cayó y a jugar."
+
+        ### CONTEXTO REGLAMENTARIO:
+        {contexto_unido}
+
+        ### PREGUNTA DEL JUGADOR:
+        {p_oficial}
+
+        ### EXPLICACIÓN DEL VETERANO (responde solo un párrafo natural):
+        """
+        
+        return llm.invoke(prompt_final)
+        
     except Exception as e:
-        return f"Lo siento, ha ocurrido un error al generar la respuesta: {str(e)}"
+        return f"Error técnico en el motor: {str(e)}"

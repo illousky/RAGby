@@ -24,7 +24,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print ("Bot iniciado y en escucha. Presiona Ctrl+C para detenerlo.")
+    print ("Bot iniciado y en escucha.\nPresiona Ctrl+C para detenerlo.")
     
     app.run_polling()
     
